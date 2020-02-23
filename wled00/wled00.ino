@@ -3,7 +3,7 @@
  */
 /*
  * @title WLED project sketch
- * @version 0.9.0-b2
+ * @version 0.9.1
  * @author Christian Schwinne
  */
 
@@ -38,6 +38,9 @@
  #include <ESP8266WiFi.h>
  #include <ESP8266mDNS.h>
  #include <ESPAsyncTCP.h>
+ extern "C" {
+ #include <user_interface.h>
+ }
 #else
  #include <WiFi.h>
  #include "esp_wifi.h"
@@ -75,6 +78,7 @@
 #include "html_other.h"
 #include "FX.h"
 #include "ir_codes.h"
+#include "const.h"
 
 
 #if IR_PIN < 0
@@ -83,23 +87,28 @@
  #endif
 #endif
 
-#ifdef ARDUINO_ARCH_ESP32
-  #undef WLED_USE_ANALOG_LEDS  // Solid RGBW not implemented for ESP32 yet
- /*#ifndef WLED_DISABLE_INFRARED
-  #include <IRremote.h>
- #endif*/ //there are issues with ESP32 infrared, so it is disabled for now
-#else
  #ifndef WLED_DISABLE_INFRARED
   #include <IRremoteESP8266.h>
   #include <IRrecv.h>
   #include <IRutils.h>
  #endif
+
+// remove flicker because PWM signal of RGB channels can become out of phase
+#if defined(WLED_USE_ANALOG_LEDS) && defined(ESP8266)
+  #include "src/dependencies/arduino/core_esp8266_waveform.h"
 #endif
 
+// enable additional debug output
+#ifdef WLED_DEBUG
+  #ifndef ESP8266
+    #include <rom/rtc.h>
+  #endif
+#endif
 
 //version code in format yymmddb (b = daily build)
-#define VERSION 1912312
-char versionString[] = "0.9.0-b2";
+#define VERSION 2002192
+
+char versionString[] = "0.9.1";
 
 
 //AP and OTA default passwords (for maximum change them!)
@@ -122,17 +131,16 @@ char cmDNS[33] = "x";                         //mDNS address (placeholder, will 
 char apSSID[33] = "";                         //AP off by default (unless setup)
 byte apChannel = 1;                           //2.4GHz WiFi AP channel (1-13)
 byte apHide = 0;                              //hidden AP SSID
-//byte apWaitTimeSecs = 32;                   //time to wait for connection before opening AP
-byte apBehavior = 0;                          //0: Open AP when no connection after boot 1: Open when no connection 2: Always open 3: Only when button pressed for 6 sec
-//bool recoveryAPDisabled = false;            //never open AP (not recommended)
+byte apBehavior = AP_BEHAVIOR_BOOT_NO_CONN;   //access point opens when no connection after boot by default
 IPAddress staticIP(0, 0, 0, 0);               //static IP of ESP
 IPAddress staticGateway(0, 0, 0, 0);          //gateway (router) IP
 IPAddress staticSubnet(255, 255, 255, 0);     //most common subnet in home networks
+bool noWifiSleep = false;                     //disabling modem sleep modes will increase heat output and power usage, but may help with connection issues
+
 
 //LED CONFIG
 uint16_t ledCount = 30;                       //overcurrent prevented by ABL
 bool useRGBW = false;                         //SK6812 strips can contain an extra White channel
-bool autoRGBtoRGBW = false;                   //if RGBW enabled, calculate White channel from RGB
 #define ABL_MILLIAMPS_DEFAULT 850;            //auto lower brightness to stay close to milliampere limit
 bool turnOnAtBoot  = true;                    //turn on LEDs at power-up
 byte bootPreset = 0;                          //save preset to load after power-up
@@ -144,12 +152,12 @@ byte briS = 128;                              //default brightness
 byte nightlightTargetBri = 0;                 //brightness after nightlight is over
 byte nightlightDelayMins = 60;
 bool nightlightFade = true;                   //if enabled, light will gradually dim towards the target bri. Otherwise, it will instantly set after delay over
+bool nightlightColorFade = false;             //if enabled, light will gradually fade color from primary to secondary color.
 bool fadeTransition = true;                   //enable crossfading color transition
 bool enableSecTransition = true;              //also enable transition for secondary color
 uint16_t transitionDelay = 750;               //default crossfade duration in ms
 
 bool skipFirstLed = false;                    //ignore first LED in strip (useful if you need the LED as signal repeater)
-uint8_t disableNLeds = 0;                     //disables N LEDs between active nodes. (Useful for spacing out lights for more traditional christmas light look)
 byte briMultiplier =  100;                    //% of brightness to set (to limit power, if you set it to 50 and set bri to 255, actual brightness will be 127)
 
 
@@ -160,7 +168,7 @@ bool syncToggleReceive = false;               //UIs which only have a single but
 
 //Sync CONFIG
 bool buttonEnabled =  true;
-bool irEnabled     = false;                   //Infrared receiver
+byte irEnabled     =  0;                      //Infrared receiver
 
 uint16_t udpPort    = 21324;                  //WLED notifier default port
 uint16_t udpRgbPort = 19446;                  //Hyperion port
@@ -186,8 +194,12 @@ bool receiveDirect    =  true;                //receive UDP realtime
 bool arlsDisableGammaCorrection = true;       //activate if gamma correction is handled by the source
 bool arlsForceMaxBri = false;                 //enable to force max brightness if source has very dark colors that would be black
 
-uint16_t e131Universe = 1;                    //settings for E1.31 (sACN) protocol
-bool e131Multicast = false;
+uint16_t e131Universe = 1;                    //settings for E1.31 (sACN) protocol (only DMX_MODE_MULTIPLE_* can span over consequtive universes)
+uint8_t  DMXMode = DMX_MODE_MULTIPLE_RGB;     //DMX mode (s.a.)
+uint16_t DMXAddress = 1;                      //DMX start address of fixture, a.k.a. first Channel [for E1.31 (sACN) protocol]
+uint8_t  DMXOldDimmer = 0;                    //only update brightness on change
+uint8_t  e131LastSequenceNumber = 0;          //to detect packet loss
+bool     e131Multicast = false;               //multicast or unicast
 
 bool mqttEnabled = false;
 char mqttDeviceTopic[33] = "";                //main MQTT topic (individual per device, default is wled/mac)
@@ -279,6 +291,7 @@ uint32_t nightlightDelayMs = 10;
 uint8_t nightlightDelayMinsDefault = nightlightDelayMins;
 unsigned long nightlightStartTime;
 byte briNlT = 0;                              //current nightlight brightness
+byte colNlT[]{0, 0, 0, 0};                    //current nightlight color
 
 //brightness
 unsigned long lastOnTime = 0;
@@ -288,6 +301,7 @@ byte briOld = 0;
 byte briT = 0;
 byte briIT = 0;
 byte briLast = 128;                           //brightness before turned off. Used for toggle function
+byte whiteLast = 128;                         //white channel before turned off. Used for toggle function
 
 //button
 bool buttonPressedBefore = false;
@@ -299,7 +313,7 @@ unsigned long buttonWaitTime = 0;
 bool notifyDirectDefault = notifyDirect;
 bool receiveNotifications = true;
 unsigned long notificationSentTime = 0;
-byte notificationSentCallMode = 0;
+byte notificationSentCallMode = NOTIFIER_CALL_MODE_INIT;
 bool notificationTwoRequired = false;
 
 //effects
@@ -359,14 +373,15 @@ bool presetApplyBri = false, presetApplyCol = true, presetApplyFx = true;
 bool saveCurrPresetCycConf = false;
 
 //realtime
-bool realtimeActive = false;
+byte realtimeMode = REALTIME_MODE_INACTIVE;
 IPAddress realtimeIP = (0,0,0,0);
 unsigned long realtimeTimeout = 0;
+
 
 //mqtt
 long lastMqttReconnectAttempt = 0;
 long lastInterfaceUpdate = 0;
-byte interfaceUpdateCallMode = 0;
+byte interfaceUpdateCallMode = NOTIFIER_CALL_MODE_INIT;
 char mqttStatusTopic[40] = ""; //this must be global because of async handlers
 
 #if AUXPIN >= 0
@@ -424,6 +439,8 @@ AsyncMqttClient* mqtt = NULL;
 void colorFromUint32(uint32_t,bool=false);
 void serveMessage(AsyncWebServerRequest*,uint16_t,String,String,byte);
 void handleE131Packet(e131_packet_t*, IPAddress);
+void arlsLock(uint32_t,byte);
+void handleOverlayDraw();
 
 #define E131_MAX_UNIVERSE_COUNT 9
 
@@ -506,6 +523,7 @@ void setup() {
 
 //main program loop
 void loop() {
+  handleIR();          //2nd call to function needed for ESP32 to return valid results -- should be good for ESP8266, too
   handleConnection();
   handleSerial();
   handleNotifications();
@@ -520,9 +538,13 @@ void loop() {
 
   handleOverlays();
   yield();
+  #ifdef WLED_USE_ANALOG_LEDS 
+  strip.setRgbwPwm();
+  #endif
+
   if (doReboot) reset();
 
-  if (!realtimeActive) //block stuff if WARLS/Adalight is enabled
+  if (!realtimeMode) //block stuff if WARLS/Adalight is enabled
   {
     if (apActive) dnsServer.processNextRequest();
     #ifndef WLED_DISABLE_OTA
@@ -538,6 +560,9 @@ void loop() {
     if (!offMode) strip.service();
   }
   yield();
+  #ifdef ESP8266
+  MDNS.update();
+  #endif
   if (millis() - lastMqttReconnectAttempt > 30000) initMqtt();
 
   //DEBUG serial logging
